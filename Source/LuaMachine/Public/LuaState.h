@@ -9,6 +9,8 @@
 #include "LuaCode.h"
 #include "Runtime/Core/Public/Containers/Queue.h"
 #include "Runtime/Launch/Resources/Version.h"
+#include "LuaDelegate.h"
+#include "LuaCommandExecutor.h"
 #include "LuaState.generated.h"
 
 LUAMACHINE_API DECLARE_LOG_CATEGORY_EXTERN(LogLuaMachine, Log, All);
@@ -103,6 +105,15 @@ struct FLuaDebug
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Lua")
 	FString What;
+};
+
+USTRUCT(BlueprintType)
+struct FLuaDelegateGroup
+{
+	GENERATED_BODY()
+
+	UPROPERTY()
+	TArray<ULuaDelegate*> LuaDelegates;
 };
 
 
@@ -278,7 +289,7 @@ public:
 
 	void GetField(int Index, const char* FieldName);
 
-	void NewUObject(UObject* Object);
+	void NewUObject(UObject* Object, lua_State* State);
 
 	void* NewUserData(size_t DataSize);
 
@@ -344,6 +355,7 @@ public:
 	static int TableFunction_package_preload(lua_State* L);
 
 	static int MetaTableFunction__call(lua_State* L);
+	static int MetaTableFunction__rawcall(lua_State* L);
 
 	static int MetaTableFunctionUserData__eq(lua_State* L);
 	static int MetaTableFunctionUserData__gc(lua_State* L);
@@ -399,9 +411,48 @@ public:
 	TSharedRef<FLuaSmartReference> AddLuaSmartReference(FLuaValue Value);
 	void RemoveLuaSmartReference(TSharedRef<FLuaSmartReference> Ref);
 
-	void SetupAndAssignUserDataMetatable(UObject* Context, TMap<FString, FLuaValue>& Metatable);
+	void SetupAndAssignUserDataMetatable(UObject* Context, TMap<FString, FLuaValue>& Metatable, lua_State* State);
 
 	const void* ToPointer(int Index);
+
+	UPROPERTY(EditAnywhere, Category = "Lua")
+	bool bRawLuaFunctionCall;
+
+	void GCLuaDelegatesCheck();
+
+	void RegisterLuaDelegate(UObject* InObject, ULuaDelegate* InLuaDelegate);
+
+	TArray<FString> GetPropertiesNames(UObject* InObject);
+	TArray<FString> GetFunctionsNames(UObject* InObject);
+
+	FLuaValue StructToLuaTable(UScriptStruct* InScriptStruct, const uint8* StructData);
+
+	UFUNCTION(BlueprintCallable, Category = "Lua")
+	FLuaValue StructToLuaTable(UScriptStruct* InScriptStruct, const TArray<uint8>& StructData);
+
+	void LuaTableToStruct(FLuaValue& LuaValue, UScriptStruct* InScriptStruct, uint8* StructData);
+
+	template<class T>
+	FLuaValue StructToLuaValue(T& InStruct)
+	{
+		return StructToLuaTable(T::StaticStruct(), (const uint8*)&InStruct);
+	}
+
+	template<class T>
+	T LuaValueToStruct(FLuaValue& LuaValue)
+	{
+		T InStruct;
+		LuaTableToStruct(LuaValue, T::StaticStruct(), (uint8*)&InStruct);
+		return InStruct;
+	}
+
+	template<class T>
+	T LuaValueToBaseStruct(FLuaValue& LuaValue)
+	{
+		T InStruct;
+		LuaTableToStruct(LuaValue, TBaseStructure<T>::Get(), (uint8*)&InStruct);
+		return InStruct;
+	}
 
 protected:
 	lua_State* L;
@@ -410,4 +461,43 @@ protected:
 	UWorld* CurrentWorld;
 
 	FLuaValue UserDataMetaTable;
+
+	virtual void LuaStateInit();
+
+	FDelegateHandle GCLuaDelegatesHandle;
+
+	UPROPERTY()
+	TMap<TWeakObjectPtr<UObject>, FLuaDelegateGroup> LuaDelegatesMap;
+
+	FLuaCommandExecutor LuaConsole;
 };
+
+#define LUACFUNCTION(FuncClass, FuncName, NumRetValues, NumArgs) static int FuncName ## _C(lua_State* L)\
+{\
+	FuncClass* LuaState = (FuncClass*)ULuaState::GetFromExtraSpace(L);\
+	int TrueNumArgs = lua_gettop(L);\
+	if (TrueNumArgs != NumArgs)\
+	{\
+		return luaL_error(L, "invalid number of arguments for %s (got %d, expected %d)", #FuncName, TrueNumArgs, NumArgs);\
+	}\
+	TArray<FLuaValue> LuaArgs;\
+	for (int32 LuaArgIndex = 0; LuaArgIndex < NumArgs; LuaArgIndex++)\
+	{\
+		LuaArgs.Add(LuaState->ToLuaValue(LuaArgIndex + 1, L));\
+	}\
+	FLuaValue NilValue;\
+	TArray<FLuaValue> RetValues = LuaState->FuncName(LuaArgs);\
+	for (int32 RetIndex = 0; RetIndex < NumRetValues; RetIndex++)\
+	{\
+		if (RetIndex < RetValues.Num())\
+		{\
+			LuaState->FromLuaValue(RetValues[RetIndex]);\
+		}\
+		else\
+		{\
+			LuaState->FromLuaValue(NilValue);\
+		}\
+	}\
+	return NumRetValues;\
+}\
+TArray<FLuaValue> FuncName(TArray<FLuaValue> LuaArgs)

@@ -5,6 +5,7 @@
 #include "LuaUserDataObject.h"
 #include "LuaMachine.h"
 #include "LuaBlueprintPackage.h"
+#include "LuaBlueprintFunctionLibrary.h"
 #include "GameFramework/Actor.h"
 #include "Runtime/Core/Public/Misc/FileHelper.h"
 #include "Runtime/Core/Public/Misc/Paths.h"
@@ -24,7 +25,9 @@ ULuaState::ULuaState()
 	bEnableLineHook = false;
 	bEnableCallHook = false;
 	bEnableReturnHook = false;
+	bRawLuaFunctionCall = false;
 
+	FCoreUObjectDelegates::GetPostGarbageCollect().AddUObject(this, &ULuaState::GCLuaDelegatesCheck);
 }
 
 void ULuaState::Error()
@@ -152,17 +155,17 @@ ULuaState* ULuaState::GetLuaState(UWorld* InWorld)
 
 		static const FString libExtension =
 #if PLATFORM_MAC || PLATFORM_IOS
-		FString("dylib");
+			FString("dylib");
 #elif PLATFORM_LINUX || PLATFORM_ANDROID
-		FString("so");
+			FString("so");
 #elif PLATFORM_WINDOWS
-		FString("dll");
+			FString("dll");
 #else
-		FString("");
+			FString("");
 #endif
 
 		OverridePackageCPath.ReplaceInline(*FString("$(LIB_EXT)"), *libExtension);
-		
+
 		lua_pushstring(L, TCHAR_TO_ANSI(*OverridePackageCPath));
 		SetField(-2, "cpath");
 	}
@@ -293,7 +296,14 @@ ULuaState* ULuaState::GetLuaState(UWorld* InWorld)
 		Pop();
 	}
 
+	LuaStateInit();
 	ReceiveLuaStateInitialized();
+
+#if WITH_EDITOR
+	LuaConsole.LuaState = this;
+	IModularFeatures::Get().RegisterModularFeature(IConsoleCommandExecutor::ModularFeatureName(), &LuaConsole);
+#endif
+
 
 	return this;
 }
@@ -426,7 +436,9 @@ TArray<uint8> ULuaState::ToByteCode(const FString& Code, const FString& CodePath
 void ULuaState::FromLuaValue(FLuaValue& LuaValue, UObject* CallContext, lua_State* State)
 {
 	if (!State)
+	{
 		State = this->L;
+	}
 
 	switch (LuaValue.Type)
 	{
@@ -500,7 +512,7 @@ void ULuaState::FromLuaValue(FLuaValue& LuaValue, UObject* CallContext, lua_Stat
 			break;
 		}
 
-		NewUObject(LuaValue.Object);
+		NewUObject(LuaValue.Object, State);
 		if (ULuaComponent* LuaComponent = Cast<ULuaComponent>(LuaValue.Object))
 		{
 			if (!LuaComponent->LuaState)
@@ -510,7 +522,7 @@ void ULuaState::FromLuaValue(FLuaValue& LuaValue, UObject* CallContext, lua_Stat
 			// ensure we are in the same LuaState
 			else if (LuaComponent->LuaState == GetClass())
 			{
-				SetupAndAssignUserDataMetatable(LuaComponent, LuaComponent->Metatable);
+				SetupAndAssignUserDataMetatable(LuaComponent, LuaComponent->Metatable, State);
 			}
 		}
 		else if (ULuaUserDataObject* LuaUserDataObject = Cast<ULuaUserDataObject>(LuaValue.Object))
@@ -522,34 +534,22 @@ void ULuaState::FromLuaValue(FLuaValue& LuaValue, UObject* CallContext, lua_Stat
 			// ensure we are in the same LuaState
 			else if (LuaUserDataObject->GetLuaState() == GetClass())
 			{
-				SetupAndAssignUserDataMetatable(LuaUserDataObject, LuaUserDataObject->Metatable);
+				SetupAndAssignUserDataMetatable(LuaUserDataObject, LuaUserDataObject->Metatable, State);
 			}
 		}
 		else {
-			bool bHasMetaTable = false;
 			if (UserDataMetaTable.Type == ELuaValueType::Table)
 			{
 				FromLuaValue(UserDataMetaTable, nullptr, State);
-				lua_setmetatable(State, -2);
-				lua_getmetatable(State, -1);
-				bHasMetaTable = true;
 			}
 			else
 			{
 				lua_newtable(State);
+				// allow comparison between userdata/UObject/UFunction
+				lua_pushcfunction(State, ULuaState::MetaTableFunctionUserData__eq);
+				lua_setfield(State, -2, "__eq");
 			}
-			// allow comparison between userdata/UObject/UFunction
-			lua_pushcfunction(State, ULuaState::MetaTableFunctionUserData__eq);
-			lua_setfield(State, -2, "__eq");
-
-			if (bHasMetaTable)
-			{
-				lua_pop(State, 1);
-			}
-			else
-			{
-				lua_setmetatable(State, -2);
-			}
+			lua_setmetatable(State, -2);
 		}
 	}
 	break;
@@ -589,7 +589,7 @@ void ULuaState::FromLuaValue(FLuaValue& LuaValue, UObject* CallContext, lua_Stat
 					LuaCallContext->Context = CallContext;
 					LuaCallContext->Function = Function;
 					lua_newtable(State);
-					lua_pushcfunction(State, ULuaState::MetaTableFunction__call);
+					lua_pushcfunction(State, bRawLuaFunctionCall ? ULuaState::MetaTableFunction__rawcall : ULuaState::MetaTableFunction__call);
 					lua_setfield(State, -2, "__call");
 					lua_setmetatable(State, -2);
 					return;
@@ -990,7 +990,6 @@ int ULuaState::MetaTableFunction__call(lua_State* L)
 		}
 	}
 
-
 	if (bImplicitSelf)
 	{
 		NArgs--;
@@ -1023,13 +1022,19 @@ int ULuaState::MetaTableFunction__call(lua_State* L)
 				LuaProp = Cast<UStructProperty>(ArrayProp->Inner);
 #endif
 				if (!LuaProp)
+				{
 					break;
+				}
 				if (LuaProp->Struct != FLuaValue::StaticStruct())
+				{
 					break;
+				}
 				// start filling the array with the rest of arguments
 				int ArgsToProcess = NArgs - StackPointer + 1;
 				if (ArgsToProcess < 1)
+				{
 					break;
+				}
 				FScriptArrayHelper_InContainer ArrayHelper(ArrayProp, LuaProp->ContainerPtrToValuePtr<uint8>(Parameters));
 				ArrayHelper.AddValues(ArgsToProcess);
 				for (int i = StackPointer; i < StackPointer + ArgsToProcess; i++)
@@ -1041,7 +1046,9 @@ int ULuaState::MetaTableFunction__call(lua_State* L)
 			break;
 		}
 		if (LuaProp->Struct != FLuaValue::StaticStruct())
+		{
 			break;
+		}
 
 		FLuaValue LuaValue = LuaState->ToLuaValue(StackPointer++, L);
 		*LuaProp->ContainerPtrToValuePtr<FLuaValue>(Parameters) = LuaValue;
@@ -1090,11 +1097,15 @@ int ULuaState::MetaTableFunction__call(lua_State* L)
 		UProperty* Prop = *FArgs;
 #endif
 		if (!Prop->HasAnyPropertyFlags(CPF_ReturnParm | CPF_OutParm))
+		{
 			continue;
+		}
 
 		// avoid input args (at all costs !)
 		if (Prop->HasAnyPropertyFlags(CPF_ConstParm | CPF_ReferenceParm))
+		{
 			continue;
+		}
 #if ENGINE_MINOR_VERSION >= 25
 		FStructProperty* LuaProp = CastField<FStructProperty>(Prop);
 		if (!LuaProp)
@@ -1153,6 +1164,164 @@ int ULuaState::MetaTableFunction__call(lua_State* L)
 
 	if (ReturnedValues > 0)
 		return ReturnedValues;
+
+	lua_pushnil(L);
+	return 1;
+}
+
+int ULuaState::MetaTableFunction__rawcall(lua_State * L)
+{
+	ULuaState* LuaState = ULuaState::GetFromExtraSpace(L);
+	FLuaUserData* LuaCallContext = (FLuaUserData*)lua_touserdata(L, 1);
+
+	if (!LuaCallContext->Context.IsValid() || !LuaCallContext->Function.IsValid())
+	{
+		return luaL_error(L, "invalid lua UFunction for UserData %p", LuaCallContext);
+	}
+
+	int NArgs = lua_gettop(L);
+
+	UObject* CallScope = LuaCallContext->Context.Get();
+	bool bImplicitSelf = false;
+	int StackPointer = 2;
+
+	if (ULuaComponent* LuaComponent = Cast<ULuaComponent>(CallScope))
+	{
+		CallScope = LuaComponent->GetOwner();
+		if (NArgs > 0)
+		{
+			FLuaValue LuaFirstArgument = LuaState->ToLuaValue(StackPointer, L);
+			if (LuaFirstArgument.Type == ELuaValueType::UObject && LuaFirstArgument.Object == LuaComponent)
+			{
+				bImplicitSelf = LuaComponent->bImplicitSelf;
+			}
+		}
+	}
+	else if (ULuaUserDataObject* LuaUserDataObject = Cast<ULuaUserDataObject>(CallScope))
+	{
+		if (NArgs > 0)
+		{
+			FLuaValue LuaFirstArgument = LuaState->ToLuaValue(StackPointer, L);
+			if (LuaFirstArgument.Type == ELuaValueType::UObject && LuaFirstArgument.Object == LuaUserDataObject)
+			{
+				bImplicitSelf = LuaUserDataObject->bImplicitSelf;
+			}
+		}
+	}
+
+	FScopeCycleCounterUObject ObjectScope(CallScope);
+	FScopeCycleCounterUObject FunctionScope(LuaCallContext->Function.Get());
+
+	void* Parameters = FMemory_Alloca(LuaCallContext->Function->ParmsSize);
+	FMemory::Memzero(Parameters, LuaCallContext->Function->ParmsSize);
+
+#if ENGINE_MINOR_VERSION >= 25
+	for (TFieldIterator<FProperty> It(LuaCallContext->Function.Get()); (It && It->HasAnyPropertyFlags(CPF_Parm)); ++It)
+	{
+		FProperty* Prop = *It;
+#else
+	for (TFieldIterator<UProperty> It(LuaCallContext->Function.Get()); (It && It->HasAnyPropertyFlags(CPF_Parm)); ++It)
+	{
+		UProperty* Prop = *It;
+#endif
+		if (!Prop->HasAnyPropertyFlags(CPF_ZeroConstructor))
+		{
+			Prop->InitializeValue_InContainer(Parameters);
+		}
+	}
+
+	if (bImplicitSelf)
+	{
+		NArgs--;
+		StackPointer++;
+	}
+
+	// arguments
+#if ENGINE_MINOR_VERSION >= 25
+	for (TFieldIterator<FProperty> FArgs(LuaCallContext->Function.Get()); FArgs && ((FArgs->PropertyFlags & (CPF_Parm | CPF_ReturnParm)) == CPF_Parm); ++FArgs)
+	{
+		FProperty* Prop = *FArgs;
+#else
+	for (TFieldIterator<UProperty> FArgs(LuaCallContext->Function.Get()); FArgs && ((FArgs->PropertyFlags & (CPF_Parm | CPF_ReturnParm)) == CPF_Parm); ++FArgs)
+	{
+		UProperty* Prop = *FArgs;
+#endif
+		bool bPropertySet = false;
+		LuaState->ToProperty(Parameters, Prop, LuaState->ToLuaValue(StackPointer++, L), bPropertySet, 0);
+	}
+
+	LuaState->InceptionLevel++;
+	CallScope->ProcessEvent(LuaCallContext->Function.Get(), Parameters);
+	check(LuaState->InceptionLevel > 0);
+	LuaState->InceptionLevel--;
+
+	if (LuaState->InceptionLevel == 0)
+	{
+		FString Error;
+		while (LuaState->InceptionErrors.Dequeue(Error))
+		{
+			ULuaComponent* LuaComponent = Cast<ULuaComponent>(LuaCallContext->Context);
+			if (LuaComponent)
+			{
+				if (LuaComponent->bLogError)
+				{
+					LuaState->LogError(Error);
+				}
+				LuaComponent->OnLuaError.Broadcast(Error);
+			}
+			else
+			{
+				if (LuaState->bLogError)
+				{
+					LuaState->LogError(Error);
+				}
+				LuaState->ReceiveLuaError(Error);
+			}
+		}
+	}
+
+	int ReturnedValues = 0;
+
+	// get return value
+#if ENGINE_MINOR_VERSION >= 25
+	for (TFieldIterator<FProperty> FArgs(LuaCallContext->Function.Get()); FArgs; ++FArgs)
+	{
+		FProperty* Prop = *FArgs;
+#else
+	for (TFieldIterator<UProperty> FArgs(LuaCallContext->Function.Get()); FArgs; ++FArgs)
+	{
+		UProperty* Prop = *FArgs;
+#endif
+		if (!Prop->HasAnyPropertyFlags(CPF_ReturnParm | CPF_OutParm))
+		{
+			continue;
+		}
+
+		// avoid input args (at all costs !)
+		if (Prop->HasAnyPropertyFlags(CPF_ConstParm | CPF_ReferenceParm))
+		{
+			continue;
+		}
+
+		bool bPropertyGet = false;
+		FLuaValue LuaValue = LuaState->FromProperty(Parameters, Prop, bPropertyGet, 0);
+		ReturnedValues++;
+		LuaState->FromLuaValue(LuaValue, nullptr, L);
+	}
+
+#if ENGINE_MINOR_VERSION >= 25
+	for (TFieldIterator<FProperty> It(LuaCallContext->Function.Get()); (It && It->HasAnyPropertyFlags(CPF_Parm)); ++It)
+#else
+	for (TFieldIterator<UProperty> It(LuaCallContext->Function.Get()); (It && It->HasAnyPropertyFlags(CPF_Parm)); ++It)
+#endif
+	{
+		It->DestroyValue_InContainer(Parameters);
+	}
+
+	if (ReturnedValues > 0)
+	{
+		return ReturnedValues;
+	}
 
 	lua_pushnil(L);
 	return 1;
@@ -1264,7 +1433,7 @@ void ULuaState::ReceiveLuaLevelAddedToWorld_Implementation(ULevel * Level, UWorl
 
 void ULuaState::ReceiveLuaStatePreInitialized_Implementation()
 {
-	
+
 }
 
 void ULuaState::ReceiveLuaStateInitialized_Implementation()
@@ -1317,7 +1486,7 @@ void ULuaState::PushRegistryTable()
 	lua_pushvalue(L, LUA_REGISTRYINDEX);
 }
 
-int32 ULuaState::GetFieldFromTree(const FString& Tree, bool bGlobal)
+int32 ULuaState::GetFieldFromTree(const FString & Tree, bool bGlobal)
 {
 	TArray<FString> Parts;
 	Tree.ParseIntoArray(Parts, TEXT("."));
@@ -1359,7 +1528,7 @@ int32 ULuaState::GetFieldFromTree(const FString& Tree, bool bGlobal)
 	return i + AdditionalPop;
 }
 
-void ULuaState::SetFieldFromTree(const FString& Tree, FLuaValue& Value, bool bGlobal, UObject * CallContext)
+void ULuaState::SetFieldFromTree(const FString & Tree, FLuaValue & Value, bool bGlobal, UObject * CallContext)
 {
 	TArray<FString> Parts;
 	Tree.ParseIntoArray(Parts, TEXT("."));
@@ -1379,9 +1548,13 @@ void ULuaState::SetFieldFromTree(const FString& Tree, FLuaValue& Value, bool bGl
 }
 
 
-void ULuaState::NewUObject(UObject * Object)
+void ULuaState::NewUObject(UObject * Object, lua_State* State)
 {
-	FLuaUserData* UserData = (FLuaUserData*)lua_newuserdata(L, sizeof(FLuaUserData));
+	if (!State)
+	{
+		State = this->L;
+	}
+	FLuaUserData* UserData = (FLuaUserData*)lua_newuserdata(State, sizeof(FLuaUserData));
 	UserData->Type = ELuaValueType::UObject;
 	UserData->Context = Object;
 	UserData->Function = nullptr;
@@ -1643,6 +1816,15 @@ void ULuaState::RemoveLuaSmartReference(TSharedRef<FLuaSmartReference> Ref)
 
 ULuaState::~ULuaState()
 {
+	FCoreUObjectDelegates::GetPostGarbageCollect().Remove(GCLuaDelegatesHandle);
+
+#if WITH_EDITOR
+	if (LuaConsole.LuaState)
+	{
+		IModularFeatures::Get().UnregisterModularFeature(IConsoleCommandExecutor::ModularFeatureName(), &LuaConsole);
+	}
+#endif
+
 	FLuaMachineModule::Get().UnregisterLuaState(this);
 
 	if (L)
@@ -1703,7 +1885,7 @@ void ULuaState::ToUProperty(void* Buffer, FProperty * Property, FLuaValue Value,
 #if ENGINE_MINOR_VERSION >= 25
 FLuaValue ULuaState::FromFProperty(void* Buffer, FProperty * Property, bool& bSuccess, int32 Index)
 #else
-FLuaValue ULuaState::FromUProperty(void* Buffer, UProperty* Property, bool& bSuccess, int32 Index)
+FLuaValue ULuaState::FromUProperty(void* Buffer, UProperty * Property, bool& bSuccess, int32 Index)
 #endif
 {
 	bSuccess = true;
@@ -1746,14 +1928,136 @@ FLuaValue ULuaState::FromUProperty(void* Buffer, UProperty* Property, bool& bSuc
 		return FLuaValue(WeakPtr.Get());
 	}
 
+#if ENGINE_MINOR_VERSION >= 25
+	if (FMulticastDelegateProperty* MulticastProperty = CastField<FMulticastDelegateProperty>(Property))
+#else
+	if (UMulticastDelegateProperty* MulticastProperty = Cast<UMulticastDelegateProperty>(Property))
+#endif
+	{
+		// Unfortunately we have no way to iterate the content of a FMulticastScriptDelegate
+		const FMulticastScriptDelegate* MulticastScriptDelegate = MulticastProperty->GetMulticastDelegate((UObject*)Buffer);
+		return CreateLuaTable();
+	}
+
+#if ENGINE_MINOR_VERSION >= 25
+	if (FDelegateProperty* DelegateProperty = CastField<FDelegateProperty>(Property))
+#else
+	if (UDelegateProperty* DelegateProperty = Cast<UDelegateProperty>(Property))
+#endif
+	{
+		const FScriptDelegate& ScriptDelegate = DelegateProperty->GetPropertyValue_InContainer(Buffer, Index);
+		return FLuaValue::FunctionOfObject((UObject*)ScriptDelegate.GetUObject(), ScriptDelegate.GetFunctionName());
+	}
+
+#if ENGINE_MINOR_VERSION >= 25
+	if (FArrayProperty* ArrayProperty = CastField<FArrayProperty>(Property))
+#else
+	if (UArrayProperty* ArrayProperty = Cast<UArrayProperty>(Property))
+#endif
+	{
+		FLuaValue NewLuaArray = CreateLuaTable();
+		FScriptArrayHelper_InContainer Helper(ArrayProperty, Buffer, Index);
+		for (int32 ArrayIndex = 0; ArrayIndex < Helper.Num(); ArrayIndex++)
+		{
+			uint8* ArrayItemPtr = Helper.GetRawPtr(ArrayIndex);
+			bool bArrayItemSuccess = false;
+			NewLuaArray.SetFieldByIndex(ArrayIndex + 1, FromProperty(ArrayItemPtr, ArrayProperty->Inner, bArrayItemSuccess, 0));
+		}
+		return NewLuaArray;
+	}
+
+#if ENGINE_MINOR_VERSION >= 25
+	if (FMapProperty* MapProperty = CastField<FMapProperty>(Property))
+#else
+	if (UMapProperty* MapProperty = Cast<UMapProperty>(Property))
+#endif
+	{
+		FLuaValue NewLuaTable = CreateLuaTable();
+		FScriptMapHelper_InContainer Helper(MapProperty, Buffer, Index);
+		for (int32 MapIndex = 0; MapIndex < Helper.Num(); MapIndex++)
+		{
+			uint8* ArrayKeyPtr = Helper.GetKeyPtr(MapIndex);
+			uint8* ArrayValuePtr = Helper.GetValuePtr(MapIndex);
+			bool bArrayItemSuccess = false;
+			NewLuaTable.SetField(
+				FromProperty(ArrayKeyPtr, MapProperty->KeyProp, bArrayItemSuccess, 0).ToString(),
+				FromProperty(ArrayValuePtr, MapProperty->ValueProp, bArrayItemSuccess, 0));
+		}
+		return NewLuaTable;
+	}
+
+#if ENGINE_MINOR_VERSION >= 25
+	if (FSetProperty* SetProperty = CastField<FSetProperty>(Property))
+#else
+	if (USetProperty* SetProperty = Cast<USetProperty>(Property))
+#endif
+	{
+		FLuaValue NewLuaArray = CreateLuaTable();
+		FScriptSetHelper_InContainer Helper(SetProperty, Buffer, Index);
+		for (int32 SetIndex = 0; SetIndex < Helper.Num(); SetIndex++)
+		{
+			uint8* ArrayItemPtr = Helper.GetElementPtr(SetIndex);
+			bool bArrayItemSuccess = false;
+			NewLuaArray.SetFieldByIndex(SetIndex + 1, FromProperty(ArrayItemPtr, SetProperty->ElementProp, bArrayItemSuccess, 0));
+		}
+		return NewLuaArray;
+	}
+
+#if ENGINE_MINOR_VERSION >= 25
+	if (FStructProperty* StructProperty = CastField<FStructProperty>(Property))
+#else
+	if (UStructProperty* StructProperty = Cast<UStructProperty>(Property))
+#endif
+	{
+		// fast path
+		if (StructProperty->Struct == FLuaValue::StaticStruct())
+		{
+			FLuaValue* LuaValuePtr = StructProperty->ContainerPtrToValuePtr<FLuaValue>(Buffer);
+			// trick for allowing lazy tables creation
+			FromLuaValue(*LuaValuePtr);
+			Pop();
+			return *LuaValuePtr;
+		}
+
+		const uint8* StructContainer = StructProperty->ContainerPtrToValuePtr<const uint8>(Buffer, Index);
+
+		return StructToLuaTable(StructProperty->Struct, StructContainer);
+	}
+
 	bSuccess = false;
 	return FLuaValue();
 }
 
+FLuaValue ULuaState::StructToLuaTable(UScriptStruct* InScriptStruct, const uint8* StructData)
+{
+	FLuaValue NewLuaTable = CreateLuaTable();
 #if ENGINE_MINOR_VERSION >= 25
-void ULuaState::ToFProperty(void* Buffer, FProperty* Property, FLuaValue Value, bool& bSuccess, int32 Index)
+	for (TFieldIterator<FProperty> It(InScriptStruct); It; ++It)
 #else
-void ULuaState::ToUProperty(void* Buffer, UProperty* Property, FLuaValue Value, bool& bSuccess, int32 Index)
+	for (TFieldIterator<UProperty> It(InScriptStruct); It; ++It)
+#endif
+	{
+#if ENGINE_MINOR_VERSION >= 25
+		FProperty* FieldProp = *It;
+#else
+		UProperty* FieldProp = *It;
+#endif
+		FString PropName = FieldProp->GetName();
+		bool bTableItemSuccess = false;
+		NewLuaTable.SetField(PropName, FromProperty((void*)StructData, FieldProp, bTableItemSuccess, 0));
+	}
+	return NewLuaTable;
+}
+
+FLuaValue ULuaState::StructToLuaTable(UScriptStruct* InScriptStruct, const TArray<uint8>& StructData)
+{
+	return StructToLuaTable(InScriptStruct, StructData.GetData());
+}
+
+#if ENGINE_MINOR_VERSION >= 25
+void ULuaState::ToFProperty(void* Buffer, FProperty * Property, FLuaValue Value, bool& bSuccess, int32 Index)
+#else
+void ULuaState::ToUProperty(void* Buffer, UProperty * Property, FLuaValue Value, bool& bSuccess, int32 Index)
 #endif
 {
 	bSuccess = true;
@@ -1796,7 +2100,136 @@ void ULuaState::ToUProperty(void* Buffer, UProperty* Property, FLuaValue Value, 
 		return;
 	}
 
+#if ENGINE_MINOR_VERSION >= 25
+	if (FMulticastDelegateProperty* MulticastProperty = CastField<FMulticastDelegateProperty>(Property))
+#else
+	if (UMulticastDelegateProperty* MulticastProperty = Cast<UMulticastDelegateProperty>(Property))
+#endif
+	{
+		ULuaDelegate* LuaDelegate = NewObject<ULuaDelegate>();
+		LuaDelegate->SetupLuaDelegate(MulticastProperty->SignatureFunction, this, Value);
+		RegisterLuaDelegate((UObject*)Buffer, LuaDelegate);
+
+		FScriptDelegate Delegate;
+		Delegate.BindUFunction(LuaDelegate, FName("LuaDelegateFunction"));
+
+		MulticastProperty->AddDelegate(Delegate, (UObject*)Buffer);
+		return;
+	}
+
+#if ENGINE_MINOR_VERSION >= 25
+	if (FDelegateProperty* DelegateProperty = CastField<FDelegateProperty>(Property))
+#else
+	if (UDelegateProperty* DelegateProperty = Cast<UDelegateProperty>(Property))
+#endif
+	{
+		ULuaDelegate* LuaDelegate = NewObject<ULuaDelegate>();
+		LuaDelegate->SetupLuaDelegate(DelegateProperty->SignatureFunction, this, Value);
+		RegisterLuaDelegate((UObject*)Buffer, LuaDelegate);
+
+		FScriptDelegate Delegate;
+		Delegate.BindUFunction(LuaDelegate, FName("LuaDelegateFunction"));
+
+		DelegateProperty->SetPropertyValue_InContainer(Buffer, Delegate, Index);
+		return;
+	}
+
+#if ENGINE_MINOR_VERSION >= 25
+	if (FStructProperty* StructProperty = CastField<FStructProperty>(Property))
+#else
+	if (UStructProperty* StructProperty = Cast<UStructProperty>(Property))
+#endif
+	{
+		// fast path
+		if (StructProperty->Struct == FLuaValue::StaticStruct())
+		{
+			FLuaValue* LuaValuePtr = StructProperty->ContainerPtrToValuePtr<FLuaValue>(Buffer);
+			*LuaValuePtr = Value;
+			return;
+		}
+
+		const uint8* StructContainer = StructProperty->ContainerPtrToValuePtr<const uint8>(Buffer, Index);
+		LuaTableToStruct(Value, StructProperty->Struct, (uint8*)StructContainer);
+		return;
+	}
+
+#if ENGINE_MINOR_VERSION >= 25
+	if (FArrayProperty* ArrayProperty = CastField<FArrayProperty>(Property))
+#else
+	if (UArrayProperty* ArrayProperty = Cast<UArrayProperty>(Property))
+#endif
+	{
+		FScriptArrayHelper_InContainer Helper(ArrayProperty, Buffer, Index);
+		TArray<FLuaValue> ArrayValues = ULuaBlueprintFunctionLibrary::LuaTableGetValues(Value);
+		Helper.Resize(ArrayValues.Num());
+		for (int32 ArrayIndex = 0; ArrayIndex < Helper.Num(); ArrayIndex++)
+		{
+			uint8* ArrayItemPtr = Helper.GetRawPtr(ArrayIndex);
+			bool bArrayItemSuccess = false;
+			ToProperty(ArrayItemPtr, ArrayProperty->Inner, ArrayValues[ArrayIndex], bArrayItemSuccess, 0);
+		}
+		return;
+	}
+
+#if ENGINE_MINOR_VERSION >= 25
+	if (FMapProperty* MapProperty = CastField<FMapProperty>(Property))
+#else
+	if (UMapProperty* MapProperty = Cast<UMapProperty>(Property))
+#endif
+	{
+		FScriptMapHelper_InContainer Helper(MapProperty, Buffer, Index);
+		Helper.EmptyValues();
+		TArray<FLuaValue> TableKeys = ULuaBlueprintFunctionLibrary::LuaTableGetKeys(Value);
+		for (FLuaValue TableKey : TableKeys)
+		{
+			int32 NewIndex = Helper.AddUninitializedValue();
+			uint8* KeyBuffer = Helper.GetKeyPtr(NewIndex);
+			uint8* ValueBuffer = Helper.GetValuePtr(NewIndex);
+			bool bTableItemSuccess = false;
+			ToProperty(KeyBuffer, Helper.GetKeyProperty(), TableKey, bTableItemSuccess, 0);
+			ToProperty(ValueBuffer, Helper.GetValueProperty(), TableKey, bTableItemSuccess, 0);
+			UDynamicClass FOo;
+		}
+		return;
+	}
+
+#if ENGINE_MINOR_VERSION >= 25
+	if (FSetProperty* SetProperty = CastField<FSetProperty>(Property))
+#else
+	if (USetProperty* SetProperty = Cast<USetProperty>(Property))
+#endif
+	{
+		FScriptSetHelper_InContainer Helper(SetProperty, Buffer, Index);
+		TArray<FLuaValue> ArrayValues = ULuaBlueprintFunctionLibrary::LuaTableGetValues(Value);
+		Helper.EmptyElements(ArrayValues.Num());
+		for (int32 ArrayIndex = 0; ArrayIndex < Helper.Num(); ArrayIndex++)
+		{
+			uint8* SetItemPtr = Helper.GetElementPtr(ArrayIndex);
+			bool bArrayItemSuccess = false;
+			ToProperty(SetItemPtr, SetProperty->ElementProp, ArrayValues[ArrayIndex], bArrayItemSuccess, 0);
+		}
+		return;
+	}
+
 	bSuccess = false;
+}
+
+void ULuaState::LuaTableToStruct(FLuaValue& LuaValue, UScriptStruct* InScriptStruct, uint8* StructData)
+{
+	TArray<FLuaValue> TableKeys = ULuaBlueprintFunctionLibrary::LuaTableGetKeys(LuaValue);
+	for (FLuaValue TableKey : TableKeys)
+	{
+#if ENGINE_MINOR_VERSION >= 25
+		FProperty* StructProp = InScriptStruct->FindPropertyByName(TableKey.ToName());
+#else
+		UProperty* StructProp = InScriptStruct->FindPropertyByName(TableKey.ToName());
+#endif
+		if (StructProp)
+		{
+			bool bStructValueSuccess = false;
+			ToProperty((void*)StructData, StructProp, LuaValue.GetField(TableKey.ToString()), bStructValueSuccess, 0);
+		}
+	}
 }
 
 #if ENGINE_MINOR_VERSION >= 25
@@ -1810,18 +2243,18 @@ FLuaValue ULuaState::FromProperty(void* Buffer, FProperty * Property, bool& bSuc
 	return FromFProperty(Buffer, Property, bSuccess, Index);
 }
 #else
-void ULuaState::ToProperty(void* Buffer, UProperty* Property, FLuaValue Value, bool& bSuccess, int32 Index)
+void ULuaState::ToProperty(void* Buffer, UProperty * Property, FLuaValue Value, bool& bSuccess, int32 Index)
 {
 	ToUProperty(Buffer, Property, Value, bSuccess, Index);
 }
-FLuaValue ULuaState::FromProperty(void* Buffer, UProperty* Property, bool& bSuccess, int32 Index)
+FLuaValue ULuaState::FromProperty(void* Buffer, UProperty * Property, bool& bSuccess, int32 Index)
 {
 	return FromUProperty(Buffer, Property, bSuccess, Index);
 }
 #endif
 
 
-FLuaValue ULuaState::GetLuaValueFromProperty(UObject* InObject, const FString& PropertyName)
+FLuaValue ULuaState::GetLuaValueFromProperty(UObject * InObject, const FString & PropertyName)
 {
 	if (!InObject)
 	{
@@ -1844,7 +2277,7 @@ FLuaValue ULuaState::GetLuaValueFromProperty(UObject* InObject, const FString& P
 	return FLuaValue();
 }
 
-bool ULuaState::SetPropertyFromLuaValue(UObject* InObject, const FString& PropertyName, FLuaValue Value)
+bool ULuaState::SetPropertyFromLuaValue(UObject * InObject, const FString & PropertyName, FLuaValue Value)
 {
 	if (!InObject)
 	{
@@ -1873,19 +2306,24 @@ void ULuaState::SetUserDataMetaTable(FLuaValue MetaTable)
 	UserDataMetaTable = MetaTable;
 }
 
-void ULuaState::SetupAndAssignUserDataMetatable(UObject* Context, TMap<FString, FLuaValue>& Metatable)
+void ULuaState::SetupAndAssignUserDataMetatable(UObject* Context, TMap<FString, FLuaValue>& Metatable, lua_State* State)
 {
-	lua_newtable(L);
-	lua_pushcfunction(L, ULuaState::MetaTableFunctionUserData__index);
-	lua_setfield(L, -2, "__index");
-	lua_pushcfunction(L, ULuaState::MetaTableFunctionUserData__newindex);
-	lua_setfield(L, -2, "__newindex");
-	lua_pushcfunction(L, ULuaState::MetaTableFunctionUserData__eq);
-	lua_setfield(L, -2, "__eq");
+	if (!State)
+	{
+		State = this->L;
+	}
+
+	lua_newtable(State);
+	lua_pushcfunction(State, ULuaState::MetaTableFunctionUserData__index);
+	lua_setfield(State, -2, "__index");
+	lua_pushcfunction(State, ULuaState::MetaTableFunctionUserData__newindex);
+	lua_setfield(State, -2, "__newindex");
+	lua_pushcfunction(State, ULuaState::MetaTableFunctionUserData__eq);
+	lua_setfield(State, -2, "__eq");
 	if (Context->IsA<ULuaUserDataObject>())
 	{
-		lua_pushcfunction(L, ULuaState::MetaTableFunctionUserData__gc);
-		lua_setfield(L, -2, "__gc");
+		lua_pushcfunction(State, ULuaState::MetaTableFunctionUserData__gc);
+		lua_setfield(State, -2, "__gc");
 	}
 
 	for (TPair<FString, FLuaValue>& Pair : Metatable)
@@ -1904,29 +2342,29 @@ void ULuaState::SetupAndAssignUserDataMetatable(UObject* Context, TMap<FString, 
 				UFunction* Function = FunctionOwner->FindFunction(Pair.Value.FunctionName);
 				if (Function)
 				{
-					FLuaUserData* LuaCallContext = (FLuaUserData*)lua_newuserdata(L, sizeof(FLuaUserData));
+					FLuaUserData* LuaCallContext = (FLuaUserData*)lua_newuserdata(State, sizeof(FLuaUserData));
 					LuaCallContext->Type = ELuaValueType::UFunction;
 					LuaCallContext->Context = Context;
 					LuaCallContext->Function = Function;
 
-					lua_newtable(L);
-					lua_pushcfunction(L, ULuaState::MetaTableFunction__call);
-					lua_setfield(L, -2, "__call");
-					lua_setmetatable(L, -2);
+					lua_newtable(State);
+					lua_pushcfunction(State, bRawLuaFunctionCall ? ULuaState::MetaTableFunction__rawcall : ULuaState::MetaTableFunction__call);
+					lua_setfield(State, -2, "__call");
+					lua_setmetatable(State, -2);
 				}
 				else
 				{
-					lua_pushnil(L);
+					lua_pushnil(State);
 				}
 			}
 		}
 		else {
-			FromLuaValue(Pair.Value);
+			FromLuaValue(Pair.Value, nullptr, State);
 		}
-		lua_setfield(L, -2, TCHAR_TO_ANSI(*Pair.Key));
+		lua_setfield(State, -2, TCHAR_TO_ANSI(*Pair.Key));
 	}
 
-	lua_setmetatable(L, -2);
+	lua_setmetatable(State, -2);
 }
 
 FLuaValue ULuaState::NewLuaUserDataObject(TSubclassOf<ULuaUserDataObject> LuaUserDataObjectClass, bool bTrackObject)
@@ -1945,7 +2383,7 @@ FLuaValue ULuaState::NewLuaUserDataObject(TSubclassOf<ULuaUserDataObject> LuaUse
 	return FLuaValue();
 }
 
-void ULuaState::SetLuaUserDataField(FLuaValue UserData, const FString& Key, FLuaValue Value)
+void ULuaState::SetLuaUserDataField(FLuaValue UserData, const FString & Key, FLuaValue Value)
 {
 	if (UserData.Type != ELuaValueType::UObject || !UserData.Object)
 		return;
@@ -1963,7 +2401,7 @@ void ULuaState::SetLuaUserDataField(FLuaValue UserData, const FString& Key, FLua
 	}
 }
 
-FLuaValue ULuaState::GetLuaUserDataField(FLuaValue UserData, const FString& Key)
+FLuaValue ULuaState::GetLuaUserDataField(FLuaValue UserData, const FString & Key)
 {
 	if (UserData.Type != ELuaValueType::UObject || !UserData.Object)
 		return FLuaValue();
@@ -1984,4 +2422,90 @@ FLuaValue ULuaState::GetLuaUserDataField(FLuaValue UserData, const FString& Key)
 const void* ULuaState::ToPointer(int Index)
 {
 	return lua_topointer(L, Index);
+}
+
+void ULuaState::LuaStateInit()
+{
+}
+
+void ULuaState::GCLuaDelegatesCheck()
+{
+	TSet<TWeakObjectPtr<UObject>> DeadObjects;
+	for (TPair<TWeakObjectPtr<UObject>, FLuaDelegateGroup>& Pair : LuaDelegatesMap)
+	{
+		if (!Pair.Key.IsValid())
+		{
+			DeadObjects.Add(Pair.Key);
+		}
+	}
+
+	for (TWeakObjectPtr<UObject>& WeakObjectPtr : DeadObjects)
+	{
+		LuaDelegatesMap.Remove(WeakObjectPtr);
+	}
+}
+
+void ULuaState::RegisterLuaDelegate(UObject * InObject, ULuaDelegate * InLuaDelegate)
+{
+	FLuaDelegateGroup* LuaDelegateGroup = LuaDelegatesMap.Find(InObject);
+	if (LuaDelegateGroup)
+	{
+		LuaDelegateGroup->LuaDelegates.Add(InLuaDelegate);
+	}
+	else
+	{
+		FLuaDelegateGroup NewLuaDelegateGroup;
+		NewLuaDelegateGroup.LuaDelegates.Add(InLuaDelegate);
+		LuaDelegatesMap.Add(InObject, NewLuaDelegateGroup);
+	}
+}
+
+TArray<FString> ULuaState::GetPropertiesNames(UObject * InObject)
+{
+	TArray<FString> Names;
+
+	if (!InObject)
+	{
+		return Names;
+	}
+
+	UClass* Class = InObject->GetClass();
+	if (!Class)
+	{
+		return Names;
+	}
+
+#if ENGINE_MINOR_VERSION >= 25
+	for (TFieldIterator<FProperty> It(Class); It; ++It)
+#else
+	for (TFieldIterator<UProperty> It(Class); It; ++It)
+#endif
+	{
+		Names.Add((*It)->GetName());
+	}
+
+	return Names;
+}
+
+TArray<FString> ULuaState::GetFunctionsNames(UObject * InObject)
+{
+	TArray<FString> Names;
+
+	if (!InObject)
+	{
+		return Names;
+	}
+
+	UClass* Class = InObject->GetClass();
+	if (!Class)
+	{
+		return Names;
+	}
+
+	for (TFieldIterator<UFunction> It(Class); It; ++It)
+	{
+		Names.Add((*It)->GetName());
+	}
+
+	return Names;
 }
